@@ -2,10 +2,10 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
-use std::thread;
 
-use ahash::AHashMap; // fast hashing
+use ahash::AHashMap;
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 struct Stats {
     min: f64,
@@ -42,13 +42,11 @@ fn process_chunk(chunk: &str) -> AHashMap<String, Stats> {
         if line.is_empty() {
             continue;
         }
-        // Using split_once to avoid extra allocation.
         if let Some((station, measurement)) = line.split_once(';') {
-            // Parse measurement; silently skip if invalid.
             if let Ok(value) = measurement.parse::<f64>() {
                 local_map
-                    .entry(station.to_string())
-                    .and_modify(|stats: &mut Stats| {
+                    .entry(station.to_owned())
+                    .and_modify(|stats| {
                         if value < stats.min {
                             stats.min = value;
                         }
@@ -71,6 +69,7 @@ fn process_chunk(chunk: &str) -> AHashMap<String, Stats> {
 }
 
 fn main() -> io::Result<()> {
+    // Open file and memory-map it.
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
@@ -78,10 +77,11 @@ fn main() -> io::Result<()> {
     }
     let file = File::open(&args[1])?;
     let mmap = unsafe { Mmap::map(&file)? };
-    // Wrap the mmap in an Arc so it lives long enough.
-    let shared_mmap = Arc::new(mmap);
-    // SAFETY: the file is assumed to be valid UTF-8.
-    let content = unsafe { std::str::from_utf8_unchecked(&shared_mmap[..]) };
+    // SAFETY: Assume file is valid UTF-8.
+    let content = unsafe { std::str::from_utf8_unchecked(&mmap[..]) };
+    // Wrap mmap in Arc so it stays alive.
+    let mmap_arc = Arc::new(&mmap);
+    // Here, content is a view into mmap_arc. We use content only for computing ranges.
     let len = content.len();
     let num_workers = 8;
     let chunk_size = len / num_workers;
@@ -100,27 +100,24 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-    let mut handles = Vec::with_capacity(num_workers);
-    for (start, end) in ranges {
-        let shared = Arc::clone(&shared_mmap);
-        let handle = thread::spawn(move || {
-            let chunk_bytes = &shared[start..end];
-            // SAFETY: file is valid UTF-8.
-            let chunk = unsafe { std::str::from_utf8_unchecked(chunk_bytes) };
+    // Process each chunk in parallel using Rayon.
+    let global_map: AHashMap<String, Stats> = ranges
+        .into_par_iter()
+        .map(|(s, e)| {
+            // Obtain a reference to the chunk via mmap_arc.
+            // Note: We use the original content slice which remains valid
+            // because mmap_arc lives until main ends.
+            let chunk = &content[s..e];
             process_chunk(chunk)
-        });
-        handles.push(handle);
-    }
-    let mut global_map: AHashMap<String, Stats> = AHashMap::new();
-    for handle in handles {
-        let local_map = handle.join().expect("Thread panicked");
-        global_map = merge_maps(global_map, local_map);
-    }
+        })
+        .reduce(|| AHashMap::new(), merge_maps);
     let mut stations: Vec<(String, Stats)> = global_map.into_iter().collect();
     stations.sort_by(|a, b| a.0.cmp(&b.0));
     for (station, stats) in stations {
         let mean = stats.sum / (stats.count as f64);
         println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
     }
+    // Keep mmap_arc alive until here.
+    drop(mmap_arc);
     Ok(())
 }
