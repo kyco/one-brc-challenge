@@ -2,10 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io;
-use std::sync::Arc;
 use std::thread;
-
-use memmap2::Mmap;
 
 struct Stats {
     min: f64,
@@ -15,33 +12,23 @@ struct Stats {
 }
 
 fn merge_maps(
-    mut global: HashMap<String, Stats>,
-    local: HashMap<String, Stats>,
-) -> HashMap<String, Stats> {
+    mut global: HashMap<&'static str, Stats>,
+    local: HashMap<&'static str, Stats>,
+) -> HashMap<&'static str, Stats> {
     for (station, stats) in local {
-        global
-            .entry(station)
-            .and_modify(|gstats| {
-                if stats.min < gstats.min {
-                    gstats.min = stats.min;
-                }
-                if stats.max > gstats.max {
-                    gstats.max = stats.max;
-                }
-                gstats.sum += stats.sum;
-                gstats.count += stats.count;
-            })
-            .or_insert(stats);
+        global.entry(station).and_modify(|gstats| {
+            if stats.min < gstats.min { gstats.min = stats.min; }
+            if stats.max > gstats.max { gstats.max = stats.max; }
+            gstats.sum += stats.sum;
+            gstats.count += stats.count;
+        }).or_insert(stats);
     }
     global
 }
 
-fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
+fn process_chunk(chunk: &'static str) -> HashMap<&'static str, Stats> {
     let mut local_map = HashMap::new();
     for line in chunk.lines() {
-        if line.is_empty() {
-            continue;
-        }
         if let Some((station, measurement)) = line.split_once(';') {
             let value: f64 = match measurement.parse() {
                 Ok(v) => v,
@@ -50,15 +37,10 @@ fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
                     continue;
                 }
             };
-            local_map
-                .entry(station.to_string())
+            local_map.entry(station)
                 .and_modify(|stats: &mut Stats| {
-                    if value < stats.min {
-                        stats.min = value;
-                    }
-                    if value > stats.max {
-                        stats.max = value;
-                    }
+                    if value < stats.min { stats.min = value; }
+                    if value > stats.max { stats.max = value; }
                     stats.sum += value;
                     stats.count += 1;
                 })
@@ -68,9 +50,8 @@ fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
                     sum: value,
                     count: 1,
                 });
-        } else {
+        } else if !line.is_empty() {
             eprintln!("Skipping invalid line: {}", line);
-            continue;
         }
     }
     local_map
@@ -83,24 +64,23 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let file = File::open(&args[1])?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    // Wrap the mmap in an Arc so it lives long enough.
-    let shared_mmap = Arc::new(mmap);
-
-    // Instead of converting to &str in main, pass the Arc to each thread.
-    // Each thread will convert its chunk to &str locally.
-    let len = shared_mmap.len();
+    // Map file into memory.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    // SAFETY: measurements.txt is assumed to be valid UTF-8.
+    let content = unsafe { std::str::from_utf8_unchecked(&mmap[..]) };
+    // Leak content to obtain a 'static lifetime.
+    let leaked: &'static str = Box::leak(content.to_owned().into_boxed_str());
+    let len = leaked.len();
     let num_workers = 8;
     let chunk_size = len / num_workers;
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
-
     for i in 0..num_workers {
         let end = if i == num_workers - 1 {
             len
         } else {
             let mut pos = start + chunk_size;
-            while pos < len && shared_mmap[pos] != b'\n' {
+            while pos < len && leaked.as_bytes()[pos] != b'\n' {
                 pos += 1;
             }
             if pos < len { pos + 1 } else { len }
@@ -108,32 +88,22 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-
     let mut handles = Vec::with_capacity(num_workers);
     for (start, end) in ranges {
-        let shared = Arc::clone(&shared_mmap);
-        let handle = thread::spawn(move || {
-            let chunk_bytes = &shared[start..end];
-            // SAFETY: The file is assumed to be valid UTF-8.
-            let chunk = unsafe { std::str::from_utf8_unchecked(chunk_bytes) };
-            process_chunk(chunk)
-        });
+        let chunk: &'static str = &leaked[start..end];
+        let handle = thread::spawn(move || process_chunk(chunk));
         handles.push(handle);
     }
-
-    let mut global_map = HashMap::new();
+    let mut global_map: HashMap<&'static str, Stats> = HashMap::new();
     for handle in handles {
         let local_map = handle.join().expect("Thread panicked");
         global_map = merge_maps(global_map, local_map);
     }
-
-    let mut stations: Vec<(String, Stats)> = global_map.into_iter().collect();
-    stations.sort_by(|a, b| a.0.cmp(&b.0));
-
+    let mut stations: Vec<(&'static str, Stats)> = global_map.into_iter().collect();
+    stations.sort_by(|a, b| a.0.cmp(b.0));
     for (station, stats) in stations {
         let mean = stats.sum / (stats.count as f64);
-        println!("{};{:.1};{:.1};{:.1}",
-                 station, stats.min, mean, stats.max);
+        println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
     }
     Ok(())
 }
