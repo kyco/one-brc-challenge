@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io;
-use std::str;
+use std::sync::Arc;
 use std::thread;
 
 use memmap2::Mmap;
@@ -42,38 +42,38 @@ fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
         if line.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.split(';').collect();
-        if parts.len() != 2 {
+        if let Some(sep) = line.find(';') {
+            let station = &line[..sep];
+            let measurement = &line[sep + 1..];
+            let value: f64 = match measurement.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("Invalid measurement '{}'", measurement);
+                    continue;
+                }
+            };
+            local_map
+                .entry(station.to_string())
+                .and_modify(|stats: &mut Stats| {
+                    if value < stats.min {
+                        stats.min = value;
+                    }
+                    if value > stats.max {
+                        stats.max = value;
+                    }
+                    stats.sum += value;
+                    stats.count += 1;
+                })
+                .or_insert(Stats {
+                    min: value,
+                    max: value,
+                    sum: value,
+                    count: 1,
+                });
+        } else {
             eprintln!("Skipping invalid line: {}", line);
             continue;
         }
-        let station = parts[0].to_string();
-        let value: f64 = match parts[1].parse() {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("Invalid measurement '{}'", parts[1]);
-                continue;
-            }
-        };
-
-        local_map
-            .entry(station)
-            .and_modify(|stats: &mut Stats| {
-                if value < stats.min {
-                    stats.min = value;
-                }
-                if value > stats.max {
-                    stats.max = value;
-                }
-                stats.sum += value;
-                stats.count += 1;
-            })
-            .or_insert(Stats {
-                min: value,
-                max: value,
-                sum: value,
-                count: 1,
-            });
     }
     local_map
 }
@@ -85,35 +85,26 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let file = File::open(&args[1])?;
+    // Map the file into memory.
     let mmap = unsafe { Mmap::map(&file)? };
-    let content = match str::from_utf8(&mmap) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("Error parsing file as UTF-8: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Wrap the mmap in an Arc so its lifetime is kept.
+    let shared_mmap = Arc::new(mmap);
 
+    let len = shared_mmap.len();
     let num_workers = 8;
-    let len = content.len();
     let chunk_size = len / num_workers;
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
 
     for i in 0..num_workers {
-        let mut end = if i == num_workers - 1 {
+        let end = if i == num_workers - 1 {
             len
         } else {
-            // tentative end, then move to next newline
             let mut pos = start + chunk_size;
-            while pos < len && content.as_bytes()[pos] != b'\n' {
+            while pos < len && shared_mmap[pos] != b'\n' {
                 pos += 1;
             }
-            if pos < len {
-                pos + 1
-            } else {
-                len
-            }
+            if pos < len { pos + 1 } else { len }
         };
         ranges.push((start, end));
         start = end;
@@ -121,10 +112,14 @@ fn main() -> io::Result<()> {
 
     let mut handles = Vec::with_capacity(num_workers);
     for (start, end) in ranges {
-        // Create a slice for the chunk.
-        let chunk = &content[start..end];
-        let chunk = chunk.to_owned(); // Own the chunk for the thread.
-        let handle = thread::spawn(move || process_chunk(&chunk));
+        let shared = Arc::clone(&shared_mmap);
+        let handle = thread::spawn(move || {
+            // Get slice of bytes from the shared mmap.
+            let chunk_bytes = &shared[start..end];
+            // Convert slice to &str. Unsafe is fine since the file is valid UTF-8.
+            let chunk = unsafe { std::str::from_utf8_unchecked(chunk_bytes) };
+            process_chunk(chunk)
+        });
         handles.push(handle);
     }
 
