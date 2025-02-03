@@ -1,11 +1,11 @@
+use ahash::AHashMap;
+use lexical_core;
+use memchr::{memchr, memchr_iter};
+use memmap2::Mmap;
+use rayon::prelude::*;
 use std::env;
 use std::fs::File;
 use std::io;
-use rayon::prelude::*;
-use ahash::AHashMap;
-use memmap2::Mmap;
-use memchr::{memchr, memchr_iter};
-use lexical_core;
 
 struct Stats {
     min: f64,
@@ -14,22 +14,31 @@ struct Stats {
     count: u64,
 }
 
+#[inline(always)]
 fn merge_maps(
     mut global: AHashMap<&'static str, Stats>,
     local: AHashMap<&'static str, Stats>,
 ) -> AHashMap<&'static str, Stats> {
     for (station, stats) in local {
-        global.entry(station).and_modify(|gstats| {
-            if stats.min < gstats.min { gstats.min = stats.min; }
-            if stats.max > gstats.max { gstats.max = stats.max; }
-            gstats.sum += stats.sum;
-            gstats.count += stats.count;
-        }).or_insert(stats);
+        global
+            .entry(station)
+            .and_modify(|gstats| {
+                if stats.min < gstats.min {
+                    gstats.min = stats.min;
+                }
+                if stats.max > gstats.max {
+                    gstats.max = stats.max;
+                }
+                gstats.sum += stats.sum;
+                gstats.count += stats.count;
+            })
+            .or_insert(stats);
     }
     global
 }
 
-// Process a chunk using memchr_iter for line splitting and lexical_core for f64 parsing.
+// Process a chunk using memchr_iter for line splitting and lexical_core for fast f64 parsing.
+#[inline(always)]
 fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
     let bytes = chunk.as_bytes();
     let mut local_map: AHashMap<&'static str, Stats> = AHashMap::with_capacity(1024);
@@ -39,12 +48,17 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
             let line = &bytes[line_start..line_end];
             if let Some(delim_idx) = memchr(b';', line) {
                 let station = unsafe { std::str::from_utf8_unchecked(&line[..delim_idx]) };
-                let measurement = unsafe { std::str::from_utf8_unchecked(&line[delim_idx+1..]) };
+                let measurement = unsafe { std::str::from_utf8_unchecked(&line[delim_idx + 1..]) };
                 if let Ok(value) = lexical_core::parse::<f64>(measurement.as_bytes()) {
-                    local_map.entry(station)
+                    local_map
+                        .entry(station)
                         .and_modify(|stats| {
-                            if value < stats.min { stats.min = value; }
-                            if value > stats.max { stats.max = value; }
+                            if value < stats.min {
+                                stats.min = value;
+                            }
+                            if value > stats.max {
+                                stats.max = value;
+                            }
                             stats.sum += value;
                             stats.count += 1;
                         })
@@ -63,12 +77,17 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
         let line = &bytes[line_start..];
         if let Some(delim_idx) = memchr(b';', line) {
             let station = unsafe { std::str::from_utf8_unchecked(&line[..delim_idx]) };
-            let measurement = unsafe { std::str::from_utf8_unchecked(&line[delim_idx+1..]) };
+            let measurement = unsafe { std::str::from_utf8_unchecked(&line[delim_idx + 1..]) };
             if let Ok(value) = lexical_core::parse::<f64>(measurement.as_bytes()) {
-                local_map.entry(station)
+                local_map
+                    .entry(station)
                     .and_modify(|stats| {
-                        if value < stats.min { stats.min = value; }
-                        if value > stats.max { stats.max = value; }
+                        if value < stats.min {
+                            stats.min = value;
+                        }
+                        if value > stats.max {
+                            stats.max = value;
+                        }
                         stats.sum += value;
                         stats.count += 1;
                     })
@@ -85,7 +104,7 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
 }
 
 fn main() -> io::Result<()> {
-    // Check command-line arguments.
+    // Verify command-line arguments.
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
@@ -95,10 +114,10 @@ fn main() -> io::Result<()> {
     let mmap = unsafe { Mmap::map(&file)? };
     // Leak the mmap to obtain a 'static lifetime.
     let leaked_mmap: &'static Mmap = Box::leak(Box::new(mmap));
-    // SAFETY: measurements.txt is assumed to be valid UTF-8.
+    // SAFETY: Assume measurements.txt is valid UTF-8.
     let content: &'static str = unsafe { std::str::from_utf8_unchecked(&leaked_mmap[..]) };
     let total_len = content.len();
-    let num_workers = 8;
+    let num_workers = rayon::current_num_threads();
     let chunk_size = total_len / num_workers;
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
@@ -110,18 +129,27 @@ fn main() -> io::Result<()> {
             while pos < total_len && content.as_bytes()[pos] != b'\n' {
                 pos += 1;
             }
-            if pos < total_len { pos + 1 } else { total_len }
+            if pos < total_len {
+                pos + 1
+            } else {
+                total_len
+            }
         };
         ranges.push((start, end));
         start = end;
     }
+    // Use Rayon fold to combine map computations in parallel.
     let global_map: AHashMap<&'static str, Stats> = ranges
         .into_par_iter()
-        .map(|(s, e)| {
-            let chunk = &content[s..e];
-            process_chunk(chunk)
-        })
-        .reduce(|| AHashMap::new(), merge_maps);
+        .fold(
+            || AHashMap::with_capacity(1024),
+            |acc, (s, e)| {
+                let chunk = &content[s..e];
+                let local = process_chunk(chunk);
+                merge_maps(acc, local)
+            },
+        )
+        .reduce(|| AHashMap::with_capacity(1024), merge_maps);
     let mut stations: Vec<(&'static str, Stats)> = global_map.into_iter().collect();
     stations.sort_by(|a, b| a.0.cmp(b.0));
     let total = stations.len();
@@ -131,7 +159,14 @@ fn main() -> io::Result<()> {
             println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
         }
         println!("... ({} records omitted) ...", total - 20);
-        for (station, stats) in stations.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+        for (station, stats) in stations
+            .iter()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             let mean = stats.sum / (stats.count as f64);
             println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
         }
