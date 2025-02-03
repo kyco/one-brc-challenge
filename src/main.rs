@@ -29,12 +29,11 @@ fn merge_maps(
     global
 }
 
-// New process_chunk using memchr_iter for line splitting.
+// Process a chunk using memchr_iter for line splitting and lexical_core for f64 parsing.
 fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
     let bytes = chunk.as_bytes();
     let mut local_map: AHashMap<&'static str, Stats> = AHashMap::with_capacity(1024);
     let mut line_start = 0;
-    // Iterate over all newlines in the chunk.
     for line_end in memchr_iter(b'\n', bytes) {
         if line_end > line_start {
             let line = &bytes[line_start..line_end];
@@ -60,7 +59,6 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
         }
         line_start = line_end + 1;
     }
-    // Process any trailing data (if last line has no newline).
     if line_start < bytes.len() {
         let line = &bytes[line_start..];
         if let Some(delim_idx) = memchr(b';', line) {
@@ -93,7 +91,6 @@ fn main() -> io::Result<()> {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
         std::process::exit(1);
     }
-    // Open the file and memory-map it.
     let file = File::open(&args[1])?;
     let mmap = unsafe { Mmap::map(&file)? };
     // Leak the mmap to obtain a 'static lifetime.
@@ -105,7 +102,6 @@ fn main() -> io::Result<()> {
     let chunk_size = total_len / num_workers;
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
-    // Compute chunk ranges using newline boundaries.
     for _ in 0..num_workers {
         let end = if start + chunk_size >= total_len {
             total_len
@@ -119,7 +115,6 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-    // Process each chunk in parallel using Rayon.
     let global_map: AHashMap<&'static str, Stats> = ranges
         .into_par_iter()
         .map(|(s, e)| {
@@ -129,9 +124,22 @@ fn main() -> io::Result<()> {
         .reduce(|| AHashMap::new(), merge_maps);
     let mut stations: Vec<(&'static str, Stats)> = global_map.into_iter().collect();
     stations.sort_by(|a, b| a.0.cmp(b.0));
-    for (station, stats) in stations {
-        let mean = stats.sum / (stats.count as f64);
-        println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
+    let total = stations.len();
+    if total > 20 {
+        for (station, stats) in stations.iter().take(10) {
+            let mean = stats.sum / (stats.count as f64);
+            println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
+        }
+        println!("... ({} records omitted) ...", total - 20);
+        for (station, stats) in stations.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+            let mean = stats.sum / (stats.count as f64);
+            println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
+        }
+    } else {
+        for (station, stats) in stations {
+            let mean = stats.sum / (stats.count as f64);
+            println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
+        }
     }
     Ok(())
 }
