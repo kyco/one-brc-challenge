@@ -1,11 +1,9 @@
 use std::env;
 use std::fs::File;
 use std::io;
-use std::sync::Arc;
-
+use rayon::prelude::*;
 use ahash::AHashMap;
 use memmap2::Mmap;
-use rayon::prelude::*;
 
 struct Stats {
     min: f64,
@@ -15,44 +13,36 @@ struct Stats {
 }
 
 fn merge_maps(
-    mut global: AHashMap<String, Stats>,
-    local: AHashMap<String, Stats>,
-) -> AHashMap<String, Stats> {
+    mut global: AHashMap<&'static str, Stats>,
+    local: AHashMap<&'static str, Stats>,
+) -> AHashMap<&'static str, Stats> {
     for (station, stats) in local {
-        global
-            .entry(station)
-            .and_modify(|gstats| {
-                if stats.min < gstats.min {
-                    gstats.min = stats.min;
-                }
-                if stats.max > gstats.max {
-                    gstats.max = stats.max;
-                }
-                gstats.sum += stats.sum;
-                gstats.count += stats.count;
-            })
-            .or_insert(stats);
+        global.entry(station).and_modify(|gstats| {
+            if stats.min < gstats.min {
+                gstats.min = stats.min;
+            }
+            if stats.max > gstats.max {
+                gstats.max = stats.max;
+            }
+            gstats.sum += stats.sum;
+            gstats.count += stats.count;
+        }).or_insert(stats);
     }
     global
 }
 
-fn process_chunk(chunk: &str) -> AHashMap<String, Stats> {
-    let mut local_map: AHashMap<String, Stats> = AHashMap::new();
+fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
+    let mut local_map: AHashMap<&'static str, Stats> = AHashMap::new();
     for line in chunk.lines() {
         if line.is_empty() {
             continue;
         }
         if let Some((station, measurement)) = line.split_once(';') {
             if let Ok(value) = measurement.parse::<f64>() {
-                local_map
-                    .entry(station.to_owned())
+                local_map.entry(station)
                     .and_modify(|stats| {
-                        if value < stats.min {
-                            stats.min = value;
-                        }
-                        if value > stats.max {
-                            stats.max = value;
-                        }
+                        if value < stats.min { stats.min = value; }
+                        if value > stats.max { stats.max = value; }
                         stats.sum += value;
                         stats.count += 1;
                     })
@@ -77,11 +67,11 @@ fn main() -> io::Result<()> {
     }
     let file = File::open(&args[1])?;
     let mmap = unsafe { Mmap::map(&file)? };
-    // SAFETY: Assume file is valid UTF-8.
-    let content = unsafe { std::str::from_utf8_unchecked(&mmap[..]) };
-    // Wrap mmap in Arc so it stays alive.
-    let mmap_arc = Arc::new(&mmap);
-    // Here, content is a view into mmap_arc. We use content only for computing ranges.
+    // Leak mmap so its lifetime becomes 'static (no extra copy)
+    let leaked_mmap: &'static Mmap = Box::leak(Box::new(mmap));
+    // SAFETY: measurements.txt is assumed to be valid UTF-8.
+    let content: &'static str =
+        unsafe { std::str::from_utf8_unchecked(&leaked_mmap[..]) };
     let len = content.len();
     let num_workers = 8;
     let chunk_size = len / num_workers;
@@ -100,24 +90,19 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-    // Process each chunk in parallel using Rayon.
-    let global_map: AHashMap<String, Stats> = ranges
+    // Process chunks in parallel using Rayon.
+    let global_map: AHashMap<&'static str, Stats> = ranges
         .into_par_iter()
         .map(|(s, e)| {
-            // Obtain a reference to the chunk via mmap_arc.
-            // Note: We use the original content slice which remains valid
-            // because mmap_arc lives until main ends.
             let chunk = &content[s..e];
             process_chunk(chunk)
         })
         .reduce(|| AHashMap::new(), merge_maps);
-    let mut stations: Vec<(String, Stats)> = global_map.into_iter().collect();
-    stations.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut stations: Vec<(&'static str, Stats)> = global_map.into_iter().collect();
+    stations.sort_by(|a, b| a.0.cmp(b.0));
     for (station, stats) in stations {
         let mean = stats.sum / (stats.count as f64);
         println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
     }
-    // Keep mmap_arc alive until here.
-    drop(mmap_arc);
     Ok(())
 }
