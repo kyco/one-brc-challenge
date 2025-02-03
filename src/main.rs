@@ -37,7 +37,6 @@ fn merge_maps(
     global
 }
 
-// Process a chunk using memchr_iter for line splitting and lexical_core for fast f64 parsing.
 #[inline(always)]
 fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
     let bytes = chunk.as_bytes();
@@ -104,7 +103,6 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
 }
 
 fn main() -> io::Result<()> {
-    // Verify command-line arguments.
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
@@ -112,13 +110,12 @@ fn main() -> io::Result<()> {
     }
     let file = File::open(&args[1])?;
     let mmap = unsafe { Mmap::map(&file)? };
-    // Leak the mmap to obtain a 'static lifetime.
     let leaked_mmap: &'static Mmap = Box::leak(Box::new(mmap));
-    // SAFETY: Assume measurements.txt is valid UTF-8.
     let content: &'static str = unsafe { std::str::from_utf8_unchecked(&leaked_mmap[..]) };
     let total_len = content.len();
     let num_workers = rayon::current_num_threads();
     let chunk_size = total_len / num_workers;
+    let content_bytes = content.as_bytes();
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
     for _ in 0..num_workers {
@@ -126,7 +123,7 @@ fn main() -> io::Result<()> {
             total_len
         } else {
             let mut pos = start + chunk_size;
-            while pos < total_len && content.as_bytes()[pos] != b'\n' {
+            while pos < total_len && content_bytes[pos] != b'\n' {
                 pos += 1;
             }
             if pos < total_len {
@@ -138,7 +135,6 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-    // Use Rayon fold to combine map computations in parallel.
     let global_map: AHashMap<&'static str, Stats> = ranges
         .into_par_iter()
         .fold(
