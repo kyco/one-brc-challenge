@@ -42,9 +42,7 @@ fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
         if line.is_empty() {
             continue;
         }
-        if let Some(sep) = line.find(';') {
-            let station = &line[..sep];
-            let measurement = &line[sep + 1..];
+        if let Some((station, measurement)) = line.split_once(';') {
             let value: f64 = match measurement.parse() {
                 Ok(v) => v,
                 Err(_) => {
@@ -85,11 +83,12 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let file = File::open(&args[1])?;
-    // Map the file into memory.
     let mmap = unsafe { Mmap::map(&file)? };
-    // Wrap the mmap in an Arc so its lifetime is kept.
+    // Wrap the mmap in an Arc so it lives long enough.
     let shared_mmap = Arc::new(mmap);
 
+    // Instead of converting to &str in main, pass the Arc to each thread.
+    // Each thread will convert its chunk to &str locally.
     let len = shared_mmap.len();
     let num_workers = 8;
     let chunk_size = len / num_workers;
@@ -114,9 +113,8 @@ fn main() -> io::Result<()> {
     for (start, end) in ranges {
         let shared = Arc::clone(&shared_mmap);
         let handle = thread::spawn(move || {
-            // Get slice of bytes from the shared mmap.
             let chunk_bytes = &shared[start..end];
-            // Convert slice to &str. Unsafe is fine since the file is valid UTF-8.
+            // SAFETY: The file is assumed to be valid UTF-8.
             let chunk = unsafe { std::str::from_utf8_unchecked(chunk_bytes) };
             process_chunk(chunk)
         });
