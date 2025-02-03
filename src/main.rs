@@ -14,19 +14,15 @@ struct Stats {
     count: u64,
 }
 
-// Merge two hash maps with &'static str keys.
+// Merge two AHashMaps with &'static str keys.
 fn merge_maps(
     mut global: AHashMap<&'static str, Stats>,
     local: AHashMap<&'static str, Stats>,
 ) -> AHashMap<&'static str, Stats> {
     for (station, stats) in local {
         global.entry(station).and_modify(|gstats| {
-            if stats.min < gstats.min {
-                gstats.min = stats.min;
-            }
-            if stats.max > gstats.max {
-                gstats.max = stats.max;
-            }
+            if stats.min < gstats.min { gstats.min = stats.min; }
+            if stats.max > gstats.max { gstats.max = stats.max; }
             gstats.sum += stats.sum;
             gstats.count += stats.count;
         }).or_insert(stats);
@@ -34,8 +30,8 @@ fn merge_maps(
     global
 }
 
-// Process a chunk by manual byte-level parsing using memchr and lexical_core.
-// Returns an AHashMap with keys as &'static str slices from the leaked file.
+// Process a chunk using manual byte-level parsing with memchr and lexical_core.
+// Returns an AHashMap keyed by &'static str slices from the leaked file contents.
 fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
     let bytes = chunk.as_bytes();
     let mut pos = 0;
@@ -49,7 +45,7 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
         if line_end > pos {
             if let Some(delim_rel) = memchr(b';', &bytes[pos..line_end]) {
                 let delim = pos + delim_rel;
-                // Safety: the entire file is valid UTF-8 and leaked.
+                // Safety: The file is assumed valid UTF-8 and its content is leaked.
                 let station = unsafe { std::str::from_utf8_unchecked(&bytes[pos..delim]) };
                 let measurement = unsafe { std::str::from_utf8_unchecked(&bytes[delim + 1..line_end]) };
                 if let Ok(value) = lexical_core::parse::<f64>(measurement.as_bytes()) {
@@ -75,23 +71,25 @@ fn process_chunk(chunk: &'static str) -> AHashMap<&'static str, Stats> {
 }
 
 fn main() -> io::Result<()> {
-    // Open file and memory-map it.
+    // Check command-line arguments.
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
         std::process::exit(1);
     }
+    // Open the file and memory-map it.
     let file = File::open(&args[1])?;
     let mmap = unsafe { Mmap::map(&file)? };
-    // Leak mmap so its lifetime becomes 'static.
+    // Leak the mmap to obtain a 'static lifetime without extra copying.
     let leaked_mmap: &'static Mmap = Box::leak(Box::new(mmap));
-    // SAFETY: file is assumed valid UTF-8.
+    // SAFETY: The file is assumed to be valid UTF-8.
     let content: &'static str = unsafe { std::str::from_utf8_unchecked(&leaked_mmap[..]) };
     let total_len = content.len();
     let num_workers = 8;
     let chunk_size = total_len / num_workers;
     let mut ranges = Vec::with_capacity(num_workers);
     let mut start = 0;
+    // Compute range boundaries by finding newline characters.
     for _ in 0..num_workers {
         let end = if start + chunk_size >= total_len {
             total_len
@@ -105,7 +103,7 @@ fn main() -> io::Result<()> {
         ranges.push((start, end));
         start = end;
     }
-    // Process chunks in parallel using Rayon.
+    // Process each chunk in parallel using Rayon.
     let global_map: AHashMap<&'static str, Stats> = ranges
         .into_par_iter()
         .map(|(s, e)| {
@@ -113,7 +111,7 @@ fn main() -> io::Result<()> {
             process_chunk(chunk)
         })
         .reduce(|| AHashMap::new(), merge_maps);
-    // Collect and sort results.
+    // Collect and sort the results.
     let mut stations: Vec<(&'static str, Stats)> = global_map.into_iter().collect();
     stations.sort_by(|a, b| a.0.cmp(b.0));
     for (station, stats) in stations {
