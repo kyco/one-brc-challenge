@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io;
+use std::str;
 use std::thread;
 
-use crossbeam_channel::unbounded;
+use memmap2::Mmap;
 
 struct Stats {
     min: f64,
@@ -35,79 +36,99 @@ fn merge_maps(
     global
 }
 
+fn process_chunk(chunk: &str) -> HashMap<String, Stats> {
+    let mut local_map = HashMap::new();
+    for line in chunk.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(';').collect();
+        if parts.len() != 2 {
+            eprintln!("Skipping invalid line: {}", line);
+            continue;
+        }
+        let station = parts[0].to_string();
+        let value: f64 = match parts[1].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Invalid measurement '{}'", parts[1]);
+                continue;
+            }
+        };
+
+        local_map
+            .entry(station)
+            .and_modify(|stats: &mut Stats| {
+                if value < stats.min {
+                    stats.min = value;
+                }
+                if value > stats.max {
+                    stats.max = value;
+                }
+                stats.sum += value;
+                stats.count += 1;
+            })
+            .or_insert(Stats {
+                min: value,
+                max: value,
+                sum: value,
+                count: 1,
+            });
+    }
+    local_map
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <measurements.txt>", args[0]);
         std::process::exit(1);
     }
-
     let file = File::open(&args[1])?;
-    let reader = BufReader::new(file);
+    let mmap = unsafe { Mmap::map(&file)? };
+    let content = match str::from_utf8(&mmap) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("Error parsing file as UTF-8: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    // Create a channel to send lines for processing
-    let (sender, receiver) = unbounded::<String>();
-
-    // Use 8 worker threads (machine has 8 cores)
     let num_workers = 8;
-    let mut handles = Vec::with_capacity(num_workers);
+    let len = content.len();
+    let chunk_size = len / num_workers;
+    let mut ranges = Vec::with_capacity(num_workers);
+    let mut start = 0;
 
-    for _ in 0..num_workers {
-        let rcv: crossbeam_channel::Receiver<String> = receiver.clone();
-        let handle = thread::spawn(move || {
-            let mut local_map: HashMap<String, Stats> = HashMap::new();
-            for line in rcv.iter() {
-                if line.is_empty() {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split(';').collect();
-                if parts.len() != 2 {
-                    eprintln!("Skipping invalid line: {}", line);
-                    continue;
-                }
-                let station = parts[0].to_string();
-                let value: f64 = match parts[1].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!("Invalid measurement '{}'", parts[1]);
-                        continue;
-                    }
-                };
-
-                local_map
-                    .entry(station)
-                    .and_modify(|stats| {
-                        if value < stats.min {
-                            stats.min = value;
-                        }
-                        if value > stats.max {
-                            stats.max = value;
-                        }
-                        stats.sum += value;
-                        stats.count += 1;
-                    })
-                    .or_insert(Stats {
-                        min: value,
-                        max: value,
-                        sum: value,
-                        count: 1,
-                    });
+    for i in 0..num_workers {
+        let mut end = if i == num_workers - 1 {
+            len
+        } else {
+            // tentative end, then move to next newline
+            let mut pos = start + chunk_size;
+            while pos < len && content.as_bytes()[pos] != b'\n' {
+                pos += 1;
             }
-            local_map
-        });
+            if pos < len {
+                pos + 1
+            } else {
+                len
+            }
+        };
+        ranges.push((start, end));
+        start = end;
+    }
+
+    let mut handles = Vec::with_capacity(num_workers);
+    for (start, end) in ranges {
+        // Create a slice for the chunk.
+        let chunk = &content[start..end];
+        let chunk = chunk.to_owned(); // Own the chunk for the thread.
+        let handle = thread::spawn(move || process_chunk(&chunk));
         handles.push(handle);
     }
 
-    // Read file lines and send them to worker threads
-    for line in reader.lines() {
-        let line = line?;
-        sender.send(line).expect("Failed to send line");
-    }
-    // Drop sender to signal workers no more messages
-    drop(sender);
-
-    // Merge results from workers
-    let mut global_map: HashMap<String, Stats> = HashMap::new();
+    let mut global_map = HashMap::new();
     for handle in handles {
         let local_map = handle.join().expect("Thread panicked");
         global_map = merge_maps(global_map, local_map);
@@ -118,7 +139,8 @@ fn main() -> io::Result<()> {
 
     for (station, stats) in stations {
         let mean = stats.sum / (stats.count as f64);
-        println!("{};{:.1};{:.1};{:.1}", station, stats.min, mean, stats.max);
+        println!("{};{:.1};{:.1};{:.1}",
+                 station, stats.min, mean, stats.max);
     }
     Ok(())
 }
